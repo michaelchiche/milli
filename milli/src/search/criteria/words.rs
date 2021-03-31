@@ -9,7 +9,7 @@ use crate::search::WordDerivationsCache;
 use super::{resolve_query_tree, Criterion, CriterionResult, Context};
 
 pub struct Words<'t> {
-    ctx: &'t dyn Context,
+    ctx: &'t dyn Context<'t>,
     query_trees: Vec<Operation>,
     candidates: Option<RoaringBitmap>,
     bucket_candidates: RoaringBitmap,
@@ -18,7 +18,7 @@ pub struct Words<'t> {
 }
 
 impl<'t> Words<'t> {
-    pub fn new(ctx: &'t dyn Context, parent: Box<dyn Criterion + 't>) -> Self {
+    pub fn new(ctx: &'t dyn Context<'t>, parent: Box<dyn Criterion + 't>) -> Self {
         Words {
             ctx,
             query_trees: Vec::default(),
