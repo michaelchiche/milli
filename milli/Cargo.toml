@@ -64,5 +64,5 @@ fst = "0.4.5"
 default = []
 
 [[bench]]
-name = "search"
+name = "typo"
 harness = false
