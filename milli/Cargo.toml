@@ -64,5 +64,5 @@ fst = "0.4.5"
 default = []
 
 [[bench]]
-name = "criterion"
+name = "songs"
 harness = false
