@@ -160,14 +160,12 @@ impl<'t, 'q> WordLevelIterator<'t, 'q> {
         }
     }
 
-    fn dig(&self, ctx: &'t dyn Context<'t>, level: &TreeLevel) -> heed::Result<Self> {
+    fn dig(&self, ctx: &'t dyn Context<'t>, level: &TreeLevel, left_interval: Option<u32>) -> heed::Result<Self> {
         let level = level.min(&self.level).clone();
         let interval_size = 4u32.pow(Into::<u8>::into(level.clone()) as u32);
         let word = self.word.clone();
         let in_prefix_cache = self.in_prefix_cache;
-        // TODO try to dig starting from the current interval
-        // let left = self.current_interval.map(|(left, _)| left);
-        let inner = ctx.word_position_iterator(&word, level, in_prefix_cache, None, None)?;
+        let inner = ctx.word_position_iterator(&word, level, in_prefix_cache, left_interval, None)?;
 
         Ok(Self {inner, level, interval_size, word, in_prefix_cache, inner_next: None, current_interval: None})
     }
@@ -209,6 +207,7 @@ struct QueryLevelIterator<'t, 'q> {
     level: TreeLevel,
     accumulator: Vec<Option<(u32, u32, RoaringBitmap)>>,
     parent_accumulator: Vec<Option<(u32, u32, RoaringBitmap)>>,
+    interval_to_skip: usize,
 }
 
 impl<'t, 'q> QueryLevelIterator<'t, 'q> {
@@ -250,6 +249,7 @@ impl<'t, 'q> QueryLevelIterator<'t, 'q> {
                 level,
                 accumulator: vec![],
                 parent_accumulator: vec![],
+                interval_to_skip: 0,
             })),
             None => Ok(None),
         }
@@ -270,12 +270,13 @@ impl<'t, 'q> QueryLevelIterator<'t, 'q> {
             None => (self.level.saturating_sub(1), None),
         };
 
+        let left_interval = self.accumulator.get(self.interval_to_skip).map(|opt| opt.as_ref().map(|(left, _, _)| *left)).flatten();
         let mut inner = Vec::with_capacity(self.inner.len());
         for word_level_iterator in self.inner.iter() {
-            inner.push(word_level_iterator.dig(ctx, &level)?);
+            inner.push(word_level_iterator.dig(ctx, &level, left_interval)?);
         }
 
-        Ok(Self {parent, inner, level, accumulator: vec![], parent_accumulator: vec![]})
+        Ok(Self {parent, inner, level, accumulator: vec![], parent_accumulator: vec![], interval_to_skip: 0})
     }
 
 
@@ -304,10 +305,10 @@ impl<'t, 'q> QueryLevelIterator<'t, 'q> {
 
     /// return the next meta-interval created from inner WordLevelIterators,
     /// and from eventual chainned QueryLevelIterator.
-    fn next(&mut self) -> heed::Result<(TreeLevel, Option<(u32, u32, RoaringBitmap)>)> {
+    fn next(&mut self, allowed_candidates: &RoaringBitmap) -> heed::Result<(TreeLevel, Option<(u32, u32, RoaringBitmap)>)> {
         let parent_result = match self.parent.as_mut() {
             Some(parent) => {
-                Some(parent.next()?)
+                Some(parent.next(allowed_candidates)?)
             },
             None => None,
         };
@@ -315,12 +316,24 @@ impl<'t, 'q> QueryLevelIterator<'t, 'q> {
         match parent_result {
             Some((parent_level, parent_next)) => {
                 let inner_next = self.inner_next(parent_level)?;
+                self.interval_to_skip += self.accumulator.iter().zip(self.parent_accumulator.iter()).skip(self.interval_to_skip).take_while(|current| {
+                    match current {
+                        (Some((_, _, inner)), Some((_, _, parent))) => {
+                            inner.is_disjoint(allowed_candidates) && parent.is_disjoint(allowed_candidates)
+                        },
+                        (Some((_, _, inner)), None) => {
+                            inner.is_disjoint(allowed_candidates)
+                        },
+                        (None, Some((_, _, parent))) => {
+                            parent.is_disjoint(allowed_candidates)
+                        },
+                        (None, None) => true,
+                    }
+                }).count();
                 self.accumulator.push(inner_next);
                 self.parent_accumulator.push(parent_next);
-                // TODO @many clean firsts intervals of both accumulators when both RoaringBitmap are empty,
-                // WARNING the cleaned intervals count needs to be kept to skip at the end
                 let mut merged_interval = None;
-                for current in self.accumulator.iter().rev().zip(self.parent_accumulator.iter()) {
+                for current in self.accumulator.iter().rev().zip(self.parent_accumulator.iter()).skip(self.interval_to_skip) {
                     if let (Some((left_a, right_a, a)), Some((left_b, right_b, b))) = current {
                         let (_, _, merged_docids) = merged_interval.get_or_insert_with(|| (left_a + left_b, right_a + right_b, RoaringBitmap::new()));
                         merged_docids.union_with(&(a & b));
@@ -346,8 +359,8 @@ struct Branch<'t, 'q> {
 }
 
 impl<'t, 'q> Branch<'t, 'q> {
-    fn next(&mut self) -> heed::Result<bool> {
-        match self.query_level_iterator.next()? {
+    fn next(&mut self, allowed_candidates: &RoaringBitmap) -> heed::Result<bool> {
+        match self.query_level_iterator.next(allowed_candidates)? {
             (tree_level, Some(last_result)) => {
                 self.last_result = last_result;
                 self.tree_level = tree_level;
@@ -367,9 +380,9 @@ impl<'t, 'q> Branch<'t, 'q> {
         let self_rank = self.compute_rank();
         let other_rank = other.compute_rank();
         let left_cmp = self_rank.cmp(&other_rank).reverse();
-        // on level: higher is better,
-        // we want to reduce highest levels first.
-        let level_cmp = self.tree_level.cmp(&other.tree_level);
+        // on level: lower is better,
+        // we want to dig faster into levels on interesting branches.
+        let level_cmp = self.tree_level.cmp(&other.tree_level).reverse();
 
         left_cmp.then(level_cmp)
     }
@@ -398,6 +411,7 @@ impl<'t, 'q> Eq for Branch<'t, 'q> {}
 fn initialize_query_level_iterators<'t, 'q>(
     ctx: &'t dyn Context<'t>,
     branches: &'q Vec<Vec<Vec<Query>>>,
+    allowed_candidates: &RoaringBitmap,
     wdcache: &mut WordDerivationsCache,
 ) -> anyhow::Result<BinaryHeap<Branch<'t, 'q>>> {
 
@@ -428,7 +442,7 @@ fn initialize_query_level_iterators<'t, 'q>(
         });
 
         if let Some(mut folded_query_level_iterators) = folded_query_level_iterators {
-            let (tree_level, last_result)  = folded_query_level_iterators.next()?;
+            let (tree_level, last_result)  = folded_query_level_iterators.next(allowed_candidates)?;
             if let Some(last_result) = last_result {
                 let branch = Branch {
                     last_result,
@@ -451,9 +465,10 @@ fn set_compute_candidates<'t>(
     wdcache: &mut WordDerivationsCache,
 ) -> anyhow::Result<Option<RoaringBitmap>>
 {
-    let mut branches_heap = initialize_query_level_iterators(ctx, branches, wdcache)?;
+    let mut branches_heap = initialize_query_level_iterators(ctx, branches, allowed_candidates, wdcache)?;
     let lowest_level = TreeLevel::min_value();
     let mut final_candidates: Option<(u32, RoaringBitmap)> = None;
+    let mut allowed_candidates = allowed_candidates.clone();
 
     while let Some(mut branch) = branches_heap.peek_mut() {
         let is_lowest_level = branch.tree_level == lowest_level;
@@ -462,7 +477,7 @@ fn set_compute_candidates<'t>(
         candidates.intersect_with(&allowed_candidates);
         if candidates.is_empty() {
             // we don't have candidates, get next interval.
-            if !branch.next()? { PeekMut::pop(branch); }
+            if !branch.next(&allowed_candidates)? { PeekMut::pop(branch); }
         }
         else if is_lowest_level {
             // we have candidates, but we can't dig deeper, return candidates.
@@ -476,23 +491,25 @@ fn set_compute_candidates<'t>(
                     // else we add current candidates to best candidates
                     // and we fetch the next page
                     } else {
+                        allowed_candidates.difference_with(candidates);
                         best_candidates.union_with(candidates);
-                        if !branch.next()? { PeekMut::pop(branch); }
+                        if !branch.next(&allowed_candidates)? { PeekMut::pop(branch); }
                         Some((best_rank, best_candidates))
                     }
                 },
                 // we take current candidates as best candidates
                 // and we fetch the next page
                 None => {
+                    allowed_candidates.difference_with(candidates);
                     let candidates = take(candidates);
-                    if !branch.next()? { PeekMut::pop(branch); }
+                    if !branch.next(&allowed_candidates)? { PeekMut::pop(branch); }
                     Some((branch_rank, candidates))
                 },
             };
         } else {
             // we have candidates, lets dig deeper in levels.
             branch.query_level_iterator = branch.query_level_iterator.dig(ctx)?;
-            if !branch.next()? { PeekMut::pop(branch); }
+            if !branch.next(&allowed_candidates)? { PeekMut::pop(branch); }
         }
 
     }
